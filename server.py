@@ -21,5 +21,17 @@ def standings():
         })
     return jsonify(sorted(teams, key=lambda t: t['name'].lower()))
 
+@app.route('/currentgw')
+def currentgw():
+    url = 'https://fantasy.premierleague.com/api/bootstrap-static/'
+    r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
+    data = r.json()
+    # Find the most recently finished gameweek
+    current = 1
+    for event in data['events']:
+        if event['finished']:
+            current = event['id']
+    return jsonify({'gw': current})
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
