@@ -49,34 +49,3 @@ def currentgw():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
-```
-
-Scroll down and click **Commit changes**. Render will automatically redeploy — wait about 2 minutes then check `https://fpl-server-5vy4.onrender.com/standings` in your browser to confirm it's working. The response should now include a `history` array for each team alongside the existing fields.
-
----
-
-**2 — Update the HTML file**
-
-Download the updated `FPL_League_Simulator.html` from this chat. This version includes:
-- Form window slider (3–15 GWs)
-- Real variance calculated from each manager's GW history
-- Fixed startup order (live data first, localStorage fallback, defaults last)
-- Duplicate `/currentgw` call removed
-- `restorePreferences()` function so sim/form/GW settings survive between sessions
-
----
-
-**3 — Rebuild the APK**
-
-On your PC:
-
-Go to your `fpl-app` folder on the Desktop, open the `www` folder inside it. Delete the existing `index.html`. Put the new `FPL_League_Simulator.html` in there and rename it to `index.html`.
-
-Open the `fpl-app` folder, click the address bar, type `cmd`, press Enter. Run:
-```
-npx cap sync
-```
-
-Wait for it to finish, then run:
-```
-npx cap open android
