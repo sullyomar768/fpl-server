@@ -16,6 +16,10 @@ def get_entry_data(entry_id):
     chips_used = [c['name'] for c in data.get('chips', [])]
     return scores, chips_used
 
+@app.route('/health')
+def health():
+    return 'ok', 200
+
 @app.route('/standings')
 def standings():
     league_id = request.args.get('league_id')
