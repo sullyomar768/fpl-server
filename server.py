@@ -17,6 +17,7 @@ ENTRY_TTL     = 6 * 60
 STANDINGS_TTL = 5 * 60
 CURRENTGW_TTL = 5 * 60
 MAX_WORKERS   = 25
+SIM_CHUNK     = 10000   # sims per chunk — keeps peak RAM ~3MB for 7 teams
 
 _entry_cache     = {}
 _standings_cache = {}
@@ -110,10 +111,10 @@ def get_league_data(league_id):
     if r.status_code != 200:
         return None, 'League not found'
 
-    data         = r.json()
-    entries      = data['standings']['results']
-    league_info  = data.get('league', {})
-    histories    = fetch_all_entries(entries)
+    data      = r.json()
+    entries   = data['standings']['results']
+    league_info = data.get('league', {})
+    histories = fetch_all_entries(entries)
 
     teams = []
     for e in entries:
@@ -141,18 +142,20 @@ def get_league_data(league_id):
     return raw, None
 
 
-# ── SIMULATION ENGINE (fully vectorised with NumPy) ───────────────────────
+# ── SIMULATION ENGINE ─────────────────────────────────────────────────────
+# Chunked NumPy: vectorised within each chunk so it's fast, but peak RAM
+# stays at ~(chunk_size × N × GWS × 8 bytes) regardless of total sims.
+# At SIM_CHUNK=10000, 7 teams, 6 GWs → ~3 MB peak. Safe for Render free tier.
 
 def trim_outliers(scores):
-    """Remove scores >2 SD above mean (chip weeks). Upward trim only."""
     if len(scores) < 4:
         return scores
     arr  = np.array(scores, dtype=float)
     mean = arr.mean()
     sd   = arr.std()
     mask = arr <= (mean + 2 * sd)
-    trimmed = arr[mask]
-    return trimmed.tolist() if len(trimmed) >= math.ceil(len(scores) / 2) else scores
+    trimmed = arr[mask].tolist()
+    return trimmed if len(trimmed) >= math.ceil(len(scores) / 2) else scores
 
 
 def calc_stats(scores):
@@ -178,7 +181,6 @@ def build_form_stats(history, season_mean, mode):
         return season_stats
     if mode == 'form':
         return recent_stats
-    # blended: 70% season + 30% recent
     return {
         'mean':     0.70 * season_stats['mean']     + 0.30 * recent_stats['mean'],
         'variance': 0.70 * season_stats['variance'] + 0.30 * recent_stats['variance'],
@@ -186,15 +188,15 @@ def build_form_stats(history, season_mean, mode):
 
 
 def run_simulation(teams, gws_played, league_start, sims, pred_mode, deductions):
-    """
-    Fully vectorised Monte Carlo simulation using NumPy.
-    All random sampling is done in bulk C calls — no Python loops over sims.
-    """
     n             = len(teams)
     gws_remaining = max(1, 38 - gws_played)
-    league_gws_played = max(1, gws_played - league_start + 1) if gws_played >= league_start else max(1, gws_played)
+    league_gws_played = (
+        max(1, gws_played - league_start + 1)
+        if gws_played >= league_start
+        else max(1, gws_played)
+    )
 
-    # Apply deductions to base points
+    # Apply deductions
     adjusted_pts = []
     for t in teams:
         pts   = t['pts']
@@ -204,99 +206,91 @@ def run_simulation(teams, gws_played, league_start, sims, pred_mode, deductions)
                 pts = max(0, pts - d['pts'])
         adjusted_pts.append(float(pts))
 
-    base_pts = np.array(adjusted_pts)  # shape (N,)
+    base_pts = np.array(adjusted_pts)
 
-    # Build Gamma params for each team
-    ks     = np.zeros(n)
-    thetas = np.zeros(n)
+    # Pre-compute Gamma params and form stats per team
+    ks         = np.zeros(n)
+    thetas     = np.zeros(n)
     stats_list = []
-
     for i, t in enumerate(teams):
         history     = t.get('history', [])
         league_hist = history[league_start - 1:] if history else []
         season_mean = adjusted_pts[i] / league_gws_played
         fs          = build_form_stats(league_hist, season_mean, pred_mode)
         stats_list.append(fs)
-        theta      = fs['variance'] / fs['mean']
-        k          = fs['mean'] / theta
-        thetas[i]  = max(theta, 0.01)
-        ks[i]      = max(k, 0.01)
+        theta     = fs['variance'] / fs['mean']
+        k         = fs['mean'] / theta
+        thetas[i] = max(theta, 0.01)
+        ks[i]     = max(k, 0.01)
 
-    # ── CHIP BONUSES (vectorised per team) ────────────────────────────────
-    # Generate chip bonus arrays: shape (N, SIMS)
-    chip_bonus_totals = np.zeros((n, sims))
+    # Accumulators
+    wins         = np.zeros(n, dtype=np.int64)
+    lasts        = np.zeros(n, dtype=np.int64)
+    proj_sum     = np.zeros(n, dtype=np.float64)
+    pos_sum      = np.zeros(n, dtype=np.float64)
+    finish_counts = np.zeros((n, n), dtype=np.int64)
 
-    for i, t in enumerate(teams):
-        chips = t.get('chips_remaining', {})
-        mean  = stats_list[i]['mean']
+    # ── CHUNKED SIMULATION LOOP ───────────────────────────────────────────
+    done = 0
+    while done < sims:
+        cs = min(SIM_CHUNK, sims - done)  # actual chunk size
 
-        # Triple Captain: adds 80-140% of team mean to one random GW per sim
-        if chips.get('3xc', 0) > 0:
-            tc_bonus = mean * (0.8 + np.random.random(sims) * 0.6)
-            chip_bonus_totals[i] += tc_bonus
+        # Chip bonuses: (N, cs)
+        chip_bonus = np.zeros((n, cs))
+        for i, t in enumerate(teams):
+            chips = t.get('chips_remaining', {})
+            mean  = stats_list[i]['mean']
+            if chips.get('3xc', 0) > 0:
+                chip_bonus[i] += mean * (0.8 + np.random.random(cs) * 0.6)
+            if chips.get('bboost', 0) > 0:
+                chip_bonus[i] += np.maximum(2.0, np.random.normal(18, 8, cs))
+            if chips.get('freehit', 0) > 0:
+                chip_bonus[i] += mean * 0.15
 
-        # Bench Boost: Gaussian(18, 8) clamped above 2
-        if chips.get('bboost', 0) > 0:
-            bb_bonus = np.maximum(2.0, np.random.normal(18, 8, sims))
-            chip_bonus_totals[i] += bb_bonus
+        # Weekly scores: (N, cs, GWS) → sum → (N, cs)
+        weekly = np.stack([
+            np.random.gamma(ks[i], thetas[i], (cs, gws_remaining))
+            for i in range(n)
+        ], axis=0)
+        weekly_totals = weekly.sum(axis=2)  # (N, cs)
 
-        # Free Hit: adds ~10% of mean (expected value of replacing worst week)
-        # Exact: modelled as a flat bonus since we can't track per-sim week order
-        # after vectorisation. Conservative estimate: +mean*0.15 per sim.
-        if chips.get('freehit', 0) > 0:
-            chip_bonus_totals[i] += mean * 0.15
+        # Final scores: (N, cs)
+        final = base_pts[:, np.newaxis] + weekly_totals + chip_bonus
 
-    # ── WEEKLY SCORE SAMPLING (all at once) ───────────────────────────────
-    # Shape: (N, SIMS, GWS_REMAINING)
-    weekly_scores = np.stack([
-        np.random.gamma(shape=ks[i], scale=thetas[i], size=(sims, gws_remaining))
-        for i in range(n)
-    ], axis=0)  # (N, SIMS, GWS)
+        # Rank: (cs, N) — argsort descending
+        ft    = final.T
+        order = np.argsort(-ft, axis=1)  # (cs, N)
 
-    # Sum across GWs: (N, SIMS)
-    weekly_totals = weekly_scores.sum(axis=2)
+        # Update accumulators
+        np.add.at(wins,  order[:, 0],  1)
+        np.add.at(lasts, order[:, -1], 1)
+        proj_sum += ft.sum(axis=0)
 
-    # Final scores: base + weekly + chip bonuses
-    # base_pts shape (N,) → broadcast to (N, SIMS)
-    final_scores = base_pts[:, np.newaxis] + weekly_totals + chip_bonus_totals
+        positions = np.empty_like(order)
+        positions[np.arange(cs)[:, np.newaxis], order] = np.arange(1, n + 1)[np.newaxis, :]
+        pos_sum += positions.sum(axis=0)
 
-    # ── RANKING ───────────────────────────────────────────────────────────
-    # order[s, r] = team index at rank r in sim s  →  transpose to (SIMS, N)
-    final_t = final_scores.T  # (SIMS, N)
-    order   = np.argsort(-final_t, axis=1)  # (SIMS, N), 0=winner
+        for r in range(n):
+            np.add.at(finish_counts[:, r], order[:, r], 1)
 
-    # Wins and lasts
-    wins  = np.bincount(order[:, 0],  minlength=n)
-    lasts = np.bincount(order[:, -1], minlength=n)
+        done += cs
 
-    # Average finishing position (1-indexed)
-    positions = np.empty_like(order)
-    positions[np.arange(sims)[:, None], order] = np.arange(1, n + 1)[np.newaxis, :]
-    avg_pos  = positions.mean(axis=0)
-    projected = final_t.mean(axis=0)
-
-    # Finish counts: finish_counts[i][r] = times team i finished at rank r
-    # Efficient: for each rank r, count how many times each team was there
-    finish_counts = np.zeros((n, n), dtype=int)
-    for r in range(n):
-        np.add.at(finish_counts[:, r], order[:, r], 1)
-
-    # ── ASSEMBLE RESULTS ──────────────────────────────────────────────────
+    # ── RESULTS ───────────────────────────────────────────────────────────
     results = []
     for i, t in enumerate(teams):
         results.append({
-            'name':          t['name'],
-            'manager':       t.get('manager', ''),
-            'pts':           int(adjusted_pts[i]),
-            'raw_pts':       t['pts'],
-            'mean':          round(adjusted_pts[i] / league_gws_played, 1),
-            'win_prob':      round(float(wins[i])  / sims * 100, 2),
-            'last_prob':     round(float(lasts[i]) / sims * 100, 2),
-            'win_count':     int(wins[i]),
-            'last_count':    int(lasts[i]),
-            'projected':     int(round(float(projected[i]))),
-            'avg_pos':       round(float(avg_pos[i]), 2),
-            'finish_counts': finish_counts[i].tolist(),
+            'name':            t['name'],
+            'manager':         t.get('manager', ''),
+            'pts':             int(adjusted_pts[i]),
+            'raw_pts':         t['pts'],
+            'mean':            round(adjusted_pts[i] / league_gws_played, 1),
+            'win_prob':        round(float(wins[i])  / sims * 100, 2),
+            'last_prob':       round(float(lasts[i]) / sims * 100, 2),
+            'win_count':       int(wins[i]),
+            'last_count':      int(lasts[i]),
+            'projected':       int(round(float(proj_sum[i]) / sims)),
+            'avg_pos':         round(float(pos_sum[i]) / sims, 2),
+            'finish_counts':   finish_counts[i].tolist(),
             'chips_remaining': t.get('chips_remaining', {}),
         })
 
