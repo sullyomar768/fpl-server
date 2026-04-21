@@ -12,32 +12,27 @@ CORS(app)
 
 HEADERS = {'User-Agent': 'Mozilla/5.0'}
 
-# ── CACHE CONFIG ──────────────────────────────────────────────────────────
 ENTRY_TTL     = 6 * 60
 STANDINGS_TTL = 5 * 60
 CURRENTGW_TTL = 5 * 60
 MAX_WORKERS   = 25
-SIM_CHUNK     = 10000   # sims per chunk — keeps peak RAM ~3MB for 7 teams
+SIM_CHUNK     = 10000
 
 _entry_cache     = {}
 _standings_cache = {}
 _currentgw_cache = {}
 _lock            = threading.RLock()
+ALL_CHIPS        = {'bboost', '3xc', 'freehit', 'wildcard'}
+_rng             = np.random.Generator(np.random.PCG64DXSM())
 
-ALL_CHIPS = {'bboost', '3xc', 'freehit', 'wildcard'}
-
-
-# ── CURRENT GW ────────────────────────────────────────────────────────────
 
 def get_current_gw():
     with _lock:
         if _currentgw_cache and (time.time() - _currentgw_cache['ts']) < CURRENTGW_TTL:
             return _currentgw_cache['gw']
     try:
-        r = requests.get(
-            'https://fantasy.premierleague.com/api/bootstrap-static/',
-            headers=HEADERS, timeout=10
-        )
+        r = requests.get('https://fantasy.premierleague.com/api/bootstrap-static/',
+                         headers=HEADERS, timeout=10)
         current = 1
         for event in r.json()['events']:
             if event['finished']:
@@ -50,8 +45,6 @@ def get_current_gw():
         with _lock:
             return _currentgw_cache.get('gw', 1)
 
-
-# ── FPL DATA FETCHING ─────────────────────────────────────────────────────
 
 def fetch_entry(entry_id):
     with _lock:
@@ -80,7 +73,7 @@ def fetch_all_entries(entries):
             else:
                 to_fetch.append(eid)
     if to_fetch:
-        print(f'[ENTRY FETCH] {len(to_fetch)} uncached / {len(entries)-len(to_fetch)} from cache')
+        print(f'[ENTRY FETCH] {len(to_fetch)} uncached / {len(entries)-len(to_fetch)} cached')
         with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(to_fetch))) as executor:
             future_map = {executor.submit(fetch_entry, eid): eid for eid in to_fetch}
             for future in as_completed(future_map):
@@ -111,10 +104,10 @@ def get_league_data(league_id):
     if r.status_code != 200:
         return None, 'League not found'
 
-    data      = r.json()
-    entries   = data['standings']['results']
+    data        = r.json()
+    entries     = data['standings']['results']
     league_info = data.get('league', {})
-    histories = fetch_all_entries(entries)
+    histories   = fetch_all_entries(entries)
 
     teams = []
     for e in entries:
@@ -143,17 +136,19 @@ def get_league_data(league_id):
 
 
 # ── SIMULATION ENGINE ─────────────────────────────────────────────────────
-# Chunked NumPy: vectorised within each chunk so it's fast, but peak RAM
-# stays at ~(chunk_size × N × GWS × 8 bytes) regardless of total sims.
-# At SIM_CHUNK=10000, 7 teams, 6 GWs → ~3 MB peak. Safe for Render free tier.
+# Optimisations applied:
+# 1. Sum-of-Gammas identity: Σ(GWS × Gamma(k,θ)) = Gamma(k×GWS, θ)
+#    Eliminates the inner GWS loop — one RNG call per team per chunk.
+# 2. Chunked: peak RAM ≈ N × CHUNK × 8 bytes (4MB for 50 teams). Never OOMs.
+# 3. Ravelled bincount: finish_counts built with one np.bincount instead of N calls.
+# 4. argsort(argsort): gives each team's rank without scatter/assignment.
+# 5. PCG64DXSM: numpy's fastest bit generator.
 
 def trim_outliers(scores):
     if len(scores) < 4:
         return scores
     arr  = np.array(scores, dtype=float)
-    mean = arr.mean()
-    sd   = arr.std()
-    mask = arr <= (mean + 2 * sd)
+    mask = arr <= (arr.mean() + 2 * arr.std())
     trimmed = arr[mask].tolist()
     return trimmed if len(trimmed) >= math.ceil(len(scores) / 2) else scores
 
@@ -170,134 +165,119 @@ def calc_stats(scores):
 
 
 def build_form_stats(history, season_mean, mode):
-    season_stats = calc_stats(trim_outliers(history)) if history else None
-    if not season_stats:
+    ss = calc_stats(trim_outliers(history)) if history else None
+    if not ss:
         return {'mean': season_mean, 'variance': season_mean * 0.25}
     if mode == 'season':
-        return season_stats
-    recent       = history[-6:]
-    recent_stats = calc_stats(trim_outliers(recent))
-    if not recent_stats or len(trim_outliers(recent)) < 3:
-        return season_stats
+        return ss
+    recent = history[-6:]
+    rs     = calc_stats(trim_outliers(recent))
+    if not rs or len(trim_outliers(recent)) < 3:
+        return ss
     if mode == 'form':
-        return recent_stats
+        return rs
     return {
-        'mean':     0.70 * season_stats['mean']     + 0.30 * recent_stats['mean'],
-        'variance': 0.70 * season_stats['variance'] + 0.30 * recent_stats['variance'],
+        'mean':     0.70 * ss['mean']     + 0.30 * rs['mean'],
+        'variance': 0.70 * ss['variance'] + 0.30 * rs['variance'],
     }
 
 
 def run_simulation(teams, gws_played, league_start, sims, pred_mode, deductions):
     n             = len(teams)
     gws_remaining = max(1, 38 - gws_played)
-    league_gws_played = (
-        max(1, gws_played - league_start + 1)
-        if gws_played >= league_start
-        else max(1, gws_played)
-    )
+    lgp           = max(1, gws_played - league_start + 1) if gws_played >= league_start else max(1, gws_played)
 
     # Apply deductions
-    adjusted_pts = []
+    adj_pts = []
     for t in teams:
-        pts   = t['pts']
-        tname = t['name'].lower()
+        pts = t['pts']
         for d in deductions:
-            if d['name'] in tname:
+            if d['name'] in t['name'].lower():
                 pts = max(0, pts - d['pts'])
-        adjusted_pts.append(float(pts))
+        adj_pts.append(float(pts))
+    base_pts = np.array(adj_pts)
 
-    base_pts = np.array(adjusted_pts)
+    # Per-team Gamma params — collapse GWS with sum-of-gammas identity
+    ks_gws  = np.zeros(n)
+    thetas  = np.zeros(n)
+    chip_tc = np.zeros(n)   # triple captain mean value (0 = unused)
+    chip_bb = np.zeros(n)   # bench boost flag (0 = unused)
+    chip_fh = np.zeros(n)   # free hit flat bonus (0 = unused)
 
-    # Pre-compute Gamma params and form stats per team
-    ks         = np.zeros(n)
-    thetas     = np.zeros(n)
-    stats_list = []
     for i, t in enumerate(teams):
         history     = t.get('history', [])
         league_hist = history[league_start - 1:] if history else []
-        season_mean = adjusted_pts[i] / league_gws_played
-        fs          = build_form_stats(league_hist, season_mean, pred_mode)
-        stats_list.append(fs)
-        theta     = fs['variance'] / fs['mean']
-        k         = fs['mean'] / theta
-        thetas[i] = max(theta, 0.01)
-        ks[i]     = max(k, 0.01)
+        fs          = build_form_stats(league_hist, adj_pts[i] / lgp, pred_mode)
+        theta       = fs['variance'] / fs['mean']
+        k           = fs['mean'] / theta
+        thetas[i]   = max(theta, 0.01)
+        ks_gws[i]   = max(k, 0.01) * gws_remaining  # sum-of-gammas
+        chips       = t.get('chips_remaining', {})
+        mean        = fs['mean']
+        if chips.get('3xc',    0) > 0: chip_tc[i] = mean
+        if chips.get('bboost', 0) > 0: chip_bb[i] = 1.0
+        if chips.get('freehit',0) > 0: chip_fh[i] = mean * 0.15
 
-    # Accumulators
+    any_chips    = chip_tc.any() or chip_bb.any() or chip_fh.any()
+    rank_offsets = (np.arange(n) * n)[np.newaxis, :]  # for ravelled bincount
+
     wins         = np.zeros(n, dtype=np.int64)
     lasts        = np.zeros(n, dtype=np.int64)
     proj_sum     = np.zeros(n, dtype=np.float64)
     pos_sum      = np.zeros(n, dtype=np.float64)
     finish_counts = np.zeros((n, n), dtype=np.int64)
 
-    # ── CHUNKED SIMULATION LOOP ───────────────────────────────────────────
     done = 0
     while done < sims:
-        cs = min(SIM_CHUNK, sims - done)  # actual chunk size
+        cs = min(SIM_CHUNK, sims - done)
 
-        # Chip bonuses: (N, cs)
-        chip_bonus = np.zeros((n, cs))
-        for i, t in enumerate(teams):
-            chips = t.get('chips_remaining', {})
-            mean  = stats_list[i]['mean']
-            if chips.get('3xc', 0) > 0:
-                chip_bonus[i] += mean * (0.8 + np.random.random(cs) * 0.6)
-            if chips.get('bboost', 0) > 0:
-                chip_bonus[i] += np.maximum(2.0, np.random.normal(18, 8, cs))
-            if chips.get('freehit', 0) > 0:
-                chip_bonus[i] += mean * 0.15
+        # Weekly totals — one gamma call per team (GWS collapsed)
+        weekly = np.empty((n, cs))
+        for i in range(n):
+            weekly[i] = _rng.standard_gamma(ks_gws[i], size=cs) * thetas[i]
 
-        # Weekly scores: (N, cs, GWS) → sum → (N, cs)
-        weekly = np.stack([
-            np.random.gamma(ks[i], thetas[i], (cs, gws_remaining))
-            for i in range(n)
-        ], axis=0)
-        weekly_totals = weekly.sum(axis=2)  # (N, cs)
+        # Chip bonuses
+        if any_chips:
+            for i in np.where(chip_tc > 0)[0]:
+                weekly[i] += chip_tc[i] * (0.8 + _rng.random(cs) * 0.6)
+            for i in np.where(chip_bb > 0)[0]:
+                weekly[i] += np.maximum(2.0, _rng.normal(18, 8, cs))
+            if chip_fh.any():
+                weekly += chip_fh[:, np.newaxis]
 
-        # Final scores: (N, cs)
-        final = base_pts[:, np.newaxis] + weekly_totals + chip_bonus
+        ft    = (weekly + base_pts[:, np.newaxis]).T   # (cs, N)
+        order = np.argsort(-ft, axis=1)                # (cs, N)
 
-        # Rank: (cs, N) — argsort descending
-        ft    = final.T
-        order = np.argsort(-ft, axis=1)  # (cs, N)
-
-        # Update accumulators
-        np.add.at(wins,  order[:, 0],  1)
-        np.add.at(lasts, order[:, -1], 1)
+        wins  += np.bincount(order[:, 0],  minlength=n)
+        lasts += np.bincount(order[:, -1], minlength=n)
         proj_sum += ft.sum(axis=0)
-
-        positions = np.empty_like(order)
-        positions[np.arange(cs)[:, np.newaxis], order] = np.arange(1, n + 1)[np.newaxis, :]
-        pos_sum += positions.sum(axis=0)
-
-        for r in range(n):
-            np.add.at(finish_counts[:, r], order[:, r], 1)
+        pos_sum  += np.argsort(order, axis=1).sum(axis=0)  # argsort(argsort) = 0-indexed ranks
+        finish_counts += np.bincount(
+            (order + rank_offsets).ravel(), minlength=n * n
+        ).reshape(n, n)
 
         done += cs
 
-    # ── RESULTS ───────────────────────────────────────────────────────────
     results = []
     for i, t in enumerate(teams):
         results.append({
             'name':            t['name'],
             'manager':         t.get('manager', ''),
-            'pts':             int(adjusted_pts[i]),
+            'pts':             int(adj_pts[i]),
             'raw_pts':         t['pts'],
-            'mean':            round(adjusted_pts[i] / league_gws_played, 1),
+            'mean':            round(adj_pts[i] / lgp, 1),
             'win_prob':        round(float(wins[i])  / sims * 100, 2),
             'last_prob':       round(float(lasts[i]) / sims * 100, 2),
             'win_count':       int(wins[i]),
             'last_count':      int(lasts[i]),
             'projected':       int(round(float(proj_sum[i]) / sims)),
-            'avg_pos':         round(float(pos_sum[i]) / sims, 2),
+            'avg_pos':         round(float(pos_sum[i]) / sims + 1, 2),
             'finish_counts':   finish_counts[i].tolist(),
             'chips_remaining': t.get('chips_remaining', {}),
         })
 
     return sorted(results, key=lambda x: x['avg_pos'])
 
-
-# ── ROUTES ────────────────────────────────────────────────────────────────
 
 @app.route('/')
 @app.route('/health')
@@ -307,8 +287,7 @@ def health():
 
 @app.route('/simulate', methods=['POST'])
 def simulate():
-    body = request.get_json(silent=True) or {}
-
+    body       = request.get_json(silent=True) or {}
     league_id  = body.get('league_id')
     sims       = min(int(body.get('sims', 100000)), 1000000)
     pred_mode  = body.get('pred_mode', 'blended')
@@ -329,21 +308,17 @@ def simulate():
     if err:
         return jsonify({'error': err}), 404
 
-    teams        = raw['teams']
-    league_start = raw['league_start']
-    league_name  = raw['league_name']
-
-    if not teams:
+    if not raw['teams']:
         return jsonify({'error': 'No teams found'}), 404
 
     t0      = time.time()
-    results = run_simulation(teams, gws_played, league_start, sims, pred_mode, deductions)
+    results = run_simulation(raw['teams'], gws_played, raw['league_start'], sims, pred_mode, deductions)
     elapsed = time.time() - t0
-    print(f'[SIM] league={league_id} teams={len(teams)} sims={sims} mode={pred_mode} elapsed={elapsed:.3f}s')
+    print(f'[SIM] league={league_id} n={len(raw["teams"])} sims={sims} elapsed={elapsed:.3f}s')
 
     return jsonify({
-        'league_name':  league_name,
-        'league_start': league_start,
+        'league_name':  raw['league_name'],
+        'league_start': raw['league_start'],
         'gws_played':   gws_played,
         'sims':         sims,
         'teams':        results,
@@ -379,7 +354,7 @@ def clearcache():
     with _lock:
         if league_id:
             removed = _standings_cache.pop(league_id, None)
-            msg = f'Cleared standings for league {league_id}' if removed else f'No cache for {league_id}'
+            msg = f'Cleared standings for {league_id}' if removed else f'No cache for {league_id}'
         else:
             n_l = len(_standings_cache); n_e = len(_entry_cache)
             _standings_cache.clear(); _entry_cache.clear(); _currentgw_cache.clear()
