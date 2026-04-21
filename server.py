@@ -299,6 +299,7 @@ def run_simulation(teams, gws_played, league_start, sims, pred_mode, deductions)
 
 # ── ROUTES ────────────────────────────────────────────────────────────────
 
+@app.route('/')
 @app.route('/health')
 def health():
     return 'ok', 200
