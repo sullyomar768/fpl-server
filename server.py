@@ -218,8 +218,11 @@ def run_simulation(teams, gws_played, league_start, sims, pred_mode, deductions)
         if chips.get('bboost', 0) > 0: chip_bb[i] = 1.0
         if chips.get('freehit',0) > 0: chip_fh[i] = mean * 0.15
 
-    any_chips    = chip_tc.any() or chip_bb.any() or chip_fh.any()
-    rank_offsets = (np.arange(n) * n)[np.newaxis, :]  # for ravelled bincount
+    any_chips = chip_tc.any() or chip_bb.any() or chip_fh.any()
+    # Pre-compute rank row indices for ravelled finish_counts bincount.
+    # We want finish_counts[team][rank], so the flat index must be team*N + rank.
+    # order[s, r] = team index at rank r, so flat = order[s,r]*N + r.
+    rank_row = np.arange(n)[np.newaxis, :]  # shape (1, N) — rank index per column
 
     wins         = np.zeros(n, dtype=np.int64)
     lasts        = np.zeros(n, dtype=np.int64)
@@ -252,8 +255,9 @@ def run_simulation(teams, gws_played, league_start, sims, pred_mode, deductions)
         lasts += np.bincount(order[:, -1], minlength=n)
         proj_sum += ft.sum(axis=0)
         pos_sum  += np.argsort(order, axis=1).sum(axis=0)  # argsort(argsort) = 0-indexed ranks
+        # Ravelled bincount: flat index = team*N + rank → reshape gives finish_counts[team][rank]
         finish_counts += np.bincount(
-            (order + rank_offsets).ravel(), minlength=n * n
+            (order * n + rank_row).ravel(), minlength=n * n
         ).reshape(n, n)
 
         done += cs
@@ -283,6 +287,11 @@ def run_simulation(teams, gws_played, league_start, sims, pred_mode, deductions)
 @app.route('/health')
 def health():
     return 'ok', 200
+
+
+@app.route('/version')
+def version():
+    return 'v3-numpy-chunked-rankrow-fix', 200
 
 
 @app.route('/simulate', methods=['POST'])
